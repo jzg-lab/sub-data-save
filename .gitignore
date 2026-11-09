@@ -1,0 +1,14 @@
+# Local captured data and exports
+/data/
+/exports/
+/state/
+/tmp/
+
+# Build output and signing material
+/dist/
+/build/
+/keys/
+*.private
+.env
+.env.*
+!.env.example
