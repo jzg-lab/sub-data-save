@@ -12,3 +12,7 @@
 .env
 .env.*
 !.env.example
+
+# Local machine metadata and private signing keys
+.DS_Store
+*.private.pem

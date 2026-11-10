@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地数据留存</title>
+  <style>
+    :root { color-scheme: light dark; font: 14px/1.45 system-ui, sans-serif; }
+    body { margin: 0; padding: 18px; color: CanvasText; background: Canvas; }
+    h1 { margin: 0 0 16px; font-size: 18px; font-weight: 650; }
+    h2 { margin: 0 0 10px; font-size: 14px; font-weight: 600; }
+    section { padding: 0 0 16px; margin: 0 0 16px; border-bottom: 1px solid color-mix(in srgb, CanvasText 18%, transparent); }
+    label { display: block; margin: 0 0 6px; color: color-mix(in srgb, CanvasText 72%, transparent); }
+    input { box-sizing: border-box; width: 100%; height: 36px; padding: 6px 9px; color: CanvasText; background: Canvas; border: 1px solid color-mix(in srgb, CanvasText 28%, transparent); border-radius: 4px; }
+    button { min-height: 34px; padding: 6px 11px; border: 1px solid color-mix(in srgb, CanvasText 30%, transparent); border-radius: 4px; color: CanvasText; background: color-mix(in srgb, CanvasText 7%, Canvas); cursor: pointer; }
+    button:disabled { opacity: .55; cursor: default; }
+    .row { display: flex; gap: 8px; align-items: end; }
+    .row label { flex: 1; }
+    .status { min-height: 20px; margin: 8px 0 0; color: color-mix(in srgb, CanvasText 68%, transparent); }
+    .records { margin: 10px 0 0; padding: 0; list-style: none; }
+    .records li { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 9px 0; border-top: 1px solid color-mix(in srgb, CanvasText 14%, transparent); }
+    .record-name { overflow-wrap: anywhere; }
+    .record-meta { display: block; color: color-mix(in srgb, CanvasText 65%, transparent); font-size: 12px; }
+    @media (max-width: 480px) { body { padding: 14px; } .row { align-items: stretch; flex-direction: column; } .row button { align-self: flex-start; } }
+  </style>
+</head>
+<body>
+  <h1>本地数据留存</h1>
+  <p>启用后自动保存成功且完整的 Claude / OpenAI 调用。</p>
+  <details>
+    <summary>高级设置</summary>
+    <p>默认使用服务器持久化目录，无需填写。更换目录后，原记录仍保留在原目录。</p>
+    <label for="directory">自定义保存目录（可选）</label>
+    <div class="row">
+      <input id="directory" autocomplete="off" placeholder="使用默认目录">
+      <button id="save" type="button">保存</button>
+    </div>
+    <p id="config-status" class="status" role="status"></p>
+  </details>
+  <section>
+    <h2>下载记录</h2>
+    <div class="row">
+      <label for="date">日期（UTC）</label>
+      <input id="date" type="date">
+      <button id="load" type="button">查看</button>
+    </div>
+    <p id="list-status" class="status" role="status"></p>
+    <ul id="records" class="records"></ul>
+  </section>
+  <script>
+    (() => {
+      const token = new URLSearchParams(location.hash.slice(1)).get('bridge_token');
+      const pending = new Map();
+      let nextID = 0;
+      const send = (type, values = {}) => new Promise((resolve, reject) => {
+        const request_id = `archive-${++nextID}`;
+        const timer = setTimeout(() => { pending.delete(request_id); reject(new Error('宿主响应超时')); }, 15000);
+        pending.set(request_id, { resolve, reject, timer });
+        parent.postMessage({ source: 'sub2api-plugin-ui', bridge_token: token, type, request_id, ...values }, '*');
+      });
+      const directory = document.querySelector('#directory');
+      const configStatus = document.querySelector('#config-status');
+      const listStatus = document.querySelector('#list-status');
+      const records = document.querySelector('#records');
+      const date = document.querySelector('#date');
+      const today = new Date();
+      date.value = today.toISOString().slice(0, 10);
+      addEventListener('message', event => {
+        if (event.source !== parent) return;
+        const data = event.data;
+        if (!data || data.source !== 'sub2api-plugin-host' || data.bridge_token !== token) return;
+        const request = pending.get(data.request_id);
+        if (!request) return;
+        clearTimeout(request.timer);
+        pending.delete(data.request_id);
+        if (data.ok) request.resolve(data); else request.reject(new Error(data.error || '操作失败'));
+      });
+      document.querySelector('#save').addEventListener('click', async () => {
+        configStatus.textContent = '正在保存…';
+        try {
+          await send('config.save', { config: { directory: directory.value.trim() } });
+          configStatus.textContent = '已保存';
+        } catch (error) { configStatus.textContent = error.message; }
+      });
+      document.querySelector('#load').addEventListener('click', async () => {
+        records.replaceChildren();
+        listStatus.textContent = '正在读取…';
+        try {
+          const result = await send('archive.list', { date: date.value });
+          for (const record of result.records || []) {
+            const item = document.createElement('li');
+            const name = document.createElement('span');
+            name.className = 'record-name';
+            name.append(document.createTextNode(record.record_id));
+            const meta = document.createElement('span');
+            meta.className = 'record-meta';
+            meta.textContent = `${(record.size / 1024).toFixed(1)} KB · ${record.instance_id}`;
+            name.append(meta);
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = '下载 JSON';
+            button.addEventListener('click', async () => {
+              button.disabled = true;
+              try {
+                await send('archive.download', { record });
+              } catch (error) { listStatus.textContent = error.message; }
+              finally { button.disabled = false; }
+            });
+            item.append(name, button);
+            records.append(item);
+          }
+          listStatus.textContent = result.records?.length ? `${result.records.length} 条记录` : '当天没有记录';
+        } catch (error) { listStatus.textContent = error.message; }
+      });
+      send('config.load').then(result => { directory.value = result.config?.directory || ''; }).catch(error => { configStatus.textContent = error.message; });
+      parent.postMessage({ source: 'sub2api-plugin-ui', bridge_token: token, type: 'sub2api.plugin.ready' }, '*');
+    })();
+  </script>
+</body>
+</html>

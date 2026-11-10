@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "id": "jzg-lab.sub-data-save",
+  "name": "Sub2API Data Save",
+  "version": "0.1.1",
+  "description": "Save successful Claude and OpenAI HTTP calls as daily JSON archives.",
+  "author": "jzg-lab",
+  "requires": {
+    "sub2api": ">=0.2.17 <0.3.0",
+    "plugin_protocol": 1,
+    "transport_api": 1,
+    "ui_bridge": 1
+  },
+  "capabilities": [
+    {
+      "id": "data.capture.v1",
+      "platform": "*",
+      "account_type": "*"
+    }
+  ],
+  "runtimes": {},
+  "ui": {
+    "entrypoint": "ui/index.html"
+  },
+  "files": {}
+}
