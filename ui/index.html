@@ -109,7 +109,11 @@
     <section class="panel" aria-labelledby="records-title">
       <div class="row between"><h2 id="records-title">历史归档</h2><div class="row"><label for="date">日期（UTC）</label><input id="date" type="date"><button id="load" type="button">刷新记录</button></div></div>
       <p class="archive-path"><span class="hint">JSON 保存目录</span><code id="archive-location">正在读取…</code></p>
-      <div class="metrics" aria-label="当日档案概况"><div class="metric"><span class="metric-label">当天调用</span><strong id="metric-records" class="metric-value">—</strong></div><div class="metric"><span class="metric-label">档案体积</span><strong id="metric-bytes" class="metric-value">—</strong></div><div class="metric"><span class="metric-label">平均单条</span><strong id="metric-average" class="metric-value">—</strong></div></div>
+      <div class="metrics" aria-label="当日归档统计">
+        <div class="metric"><span class="metric-label">当天归档记录数</span><strong id="metric-records" class="metric-value">—</strong></div>
+        <div class="metric"><span class="metric-label">当天 JSON 文件总大小</span><strong id="metric-bytes" class="metric-value">—</strong></div>
+        <div class="metric"><span class="metric-label">每条 JSON 平均大小</span><strong id="metric-average" class="metric-value">—</strong></div>
+      </div>
       <h3 class="chart-title">单条档案体积分布</h3>
       <div id="size-chart" class="size-chart" role="img" aria-label="当天单条档案体积分布"></div>
       <label for="record-search" class="chart-title">筛选当天记录</label>
@@ -151,16 +155,7 @@
           path.className = 'record-meta';
           path.textContent = `${(record.date || date.value).replaceAll('-', '/')}/${record.instance_id}/${record.record_id}.json`;
           name.append(meta, path);
-          const button = document.createElement('button');
-          button.type = 'button';
-          button.textContent = '下载 JSON';
-          button.addEventListener('click', async () => {
-            button.disabled = true;
-            try { await send('archive.download', { record }); }
-            catch (error) { listStatus.textContent = error.message; }
-            finally { button.disabled = false; }
-          });
-          item.append(name, button);
+          item.append(name);
           records.append(item);
         }
       };
@@ -291,7 +286,12 @@
         } catch (error) { configStatus.textContent = error.message; }
         finally { saving = false; updateSave(); }
       });
-      const formatBytes = bytes => `${bytes.toLocaleString('zh-CN')} B`;
+      const formatBytes = bytes => {
+        const unit = bytes >= 1e12 ? 2 : bytes >= 1e9 ? 1 : 0;
+        if (bytes > 0 && bytes < 100) return '< 0.0001 MB';
+        const size = (bytes / 1000 ** (unit + 2)).toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+        return `${size} ${['MB', 'GB', 'TB'][unit]}`;
+      };
       let listVersion = 0;
       const loadRecords = async () => {
         const version = ++listVersion;
@@ -311,9 +311,9 @@
           metricBytes.textContent = formatBytes(totalBytes);
           metricAverage.textContent = formatBytes(listedRecords.length ? Math.round(totalBytes / listedRecords.length) : 0);
           const bins = [0, 0, 0, 0];
-          for (const record of listedRecords) bins[record.size < 1024 ? 0 : record.size < 10240 ? 1 : record.size < 102400 ? 2 : 3]++;
+          for (const record of listedRecords) bins[record.size < 1000 ? 0 : record.size < 10000 ? 1 : record.size < 100000 ? 2 : 3]++;
           const maxCount = Math.max(1, ...bins);
-          const labels = ['< 1 KiB', '1–10 KiB', '10–100 KiB', '≥ 100 KiB'];
+          const labels = ['< 0.001 MB', '0.001–0.01 MB', '0.01–0.1 MB', '≥ 0.1 MB'];
           sizeChart.replaceChildren(...bins.map((amount, index) => {
             const row = document.createElement('div');
             row.className = 'size-row';
