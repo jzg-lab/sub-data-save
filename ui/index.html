@@ -76,7 +76,7 @@
   <main>
     <header>
       <h1>本地数据留存</h1>
-      <p class="hint">启用后自动保存成功且完整的 Claude / OpenAI 调用。</p>
+      <p class="hint">按分组和请求模型逐次保存上游请求与响应。正文保留业务内容，API key 经遮盖后归档。</p>
     </header>
     <fieldset id="config-settings" aria-labelledby="settings-title" disabled>
         <legend id="settings-title">保存范围</legend>
@@ -268,7 +268,7 @@
         if (data.ok) request.resolve(data); else request.reject(new Error(data.error || '操作失败'));
       });
       const showArchiveLocation = root => {
-        document.querySelector('#archive-location').textContent = `JSON 归档根目录：${root || '宿主持久化目录下的 archive/'}。下方显示相对路径。`;
+        document.querySelector('#archive-location').textContent = `JSON 归档根目录：${(root || '宿主持久化目录下的 archive').replace(/\/+$/, '')}/rawdata-v2。下方显示相对路径。`;
       };
       save.addEventListener('click', async () => {
         saving = true;

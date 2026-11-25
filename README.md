@@ -1,15 +1,22 @@
 # sub-data-save
 
-为 Sub2API 采集成功调用的上游原始 Request / Response，积累用于知识库和后训练的数据档案。
+为 Sub2API 按上游调用保存 Request / Response，供按日期下载和 JSONL 聚合。
 
-**当前源码版本：0.2.0；本地实现尚未发布或部署。旧宿主必须先更新一次，才支持采集能力。**
+**源码版本 0.3.1。依赖支持 Rawdata v2 的网关，已使用 0.3.0 的部署只需更新插件。**
 
-## 第一版目标
+## 采集范围
 
-- 只覆盖 Claude/OpenAI 普通 HTTP 模型调用；完整结束的 HTTP 流式响应也保存。
-- 成功调用按请求模型聚合为 UTC 日期 JSONL 分片，每片上限 10,000,000,000 字节；逐条下载档案达到配额后不再新增原始 JSON，但继续写 JSONL。
-- 配置 S3 bucket 和 AWS region 后，封口分片上传到 `YYYY-MM-DD/model/` 下；使用 AWS 默认凭证链，凭证不得写入插件配置。
-- 失败、断流和客户端断开不保存；逐条档案配额满后仅原始 JSON 停止新增，JSONL 继续记录。采集故障不阻断模型调用。
+- 支持 Claude/OpenAI 上游业务 HTTP、SSE 和 OpenAI WebSocket。每次尝试独立归档，包含收到的错误响应。`response_complete` 标记响应是否完整。
+- HTTP 与 SSE 正文为字符串。WebSocket 的请求为原消息字符串，响应为按接收顺序排列的消息字符串数组。
+- 已知 API key 和可识别的凭据值在网关内存中遮盖。保留文本中的 `ciyuan.fast`、`ciyuan`（忽略大小写）及 `词元` 替换为 `中转`。对话、代码、附件与业务内容仍属客户私有数据。
+- 新记录保存到配置目录的 `rawdata-v2/`。每次调用先保存独立 JSON，再追加 JSONL。单条配额、磁盘预留、可用内存或队列不足时会漏存，转发继续。
+- S3 对象位于 `rawdata-v2/YYYY-MM-DD/model/`。升级前停用旧采集与上传，更新后再启用。旧包、对象和分片需要单独管理。
+
+## 每日取包
+
+插件在北京时间每天中午 12:00 生成 `<配置目录>/rawdata-v2/daily/YYYY-MM-DD.zip`，文件名为截止日期。直接复制这个 ZIP 即可。包内保留每次调用的独立 JSON 和原相对路径，可以用 `unzip -t 文件名.zip` 检查完整性。日包保存在服务器本地，已有 S3 上传流程继续传送 JSONL 分片。
+
+首次运行和停机恢复时，会将最近一次中午截止前已落盘、尚未入包的记录收进一个包。边界按文件修改时间计算，迟到记录由后续包补收。打包失败会在一分钟后重试。请复制并保留服务器上的 ZIP，插件用已有包的目录核对哪些记录已收录。源 JSON 和 ZIP 都占用磁盘，现有采集配额继续生效。
 
 ## 文档入口
 
@@ -25,9 +32,9 @@
 
 ## 安装前提
 
-1. 必须使用包含 `data.capture.v1` UI Bridge `archive.groups`/`archive.models` 的宿主版本，并为采集记录提供 `group_id` 和原始 `requested_model`；不兼容宿主不可配置采集筛选。
+1. 宿主须支持 `data.capture.v1`、UI Bridge `archive.groups`/`archive.models`、v2 记录与原请求模型的筛选摘要。旧网关送来的记录会被拒收。
 2. 选择与宿主系统和架构匹配的签名 `.s2plugin`。宿主内置发布者公钥并限定插件 ID 为 `jzg-lab.sub-data-save`。
-3. 在后台的采集设置中勾选分组和精确请求模型，可逐项勾选、全选或清空。两份名单必须都非空且同时命中才会保存记录。更换 0.2.x 前保留 `group_ids` 和 `models` 配置。
+3. 选择分组和精确请求模型，可逐项勾选、全选或清空。两份名单必须都非空且同时命中才会保存记录。升级时保留 `group_ids` 和 `models` 配置。
 4. 默认保存在宿主持久化目录；可选配置 S3 bucket 与 region，运行环境需提供 AWS 默认凭证链权限。
 5. 历史归档按 UTC 日期列出记录 ID、实例、单条大小和相对文件路径，显示当日条数、JSON 文件总大小和每条平均大小。文件大小按十进制显示为 MB、GB 或 TB。JSONL 封口后异步上传到 bucket，宿主状态目录所在卷须持久化。
 ## 构建与本地验证
@@ -40,7 +47,7 @@ GOOS=darwin GOARCH=arm64 ./build.sh
 
 构建默认签名，私钥从 `S2PLUGIN_KEY` 或 `~/.config/sub-data-save/publisher-v1.private.pem` 读取；不自动生成或提交私钥。`S2PLUGIN_UNSIGNED=1` 仅用于明确允许未签名包的开发环境。
 
-当前源码版本为 0.2.0。Linux amd64 和 macOS arm64 签名包位于 `dist/`，已验签并核对包内文件哈希，待生产进程验收。
+部署新版本前需从当前源码构建签名包。
 
 ## 当前成果来源
 

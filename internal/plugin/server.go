@@ -3,6 +3,7 @@ package plugin
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"os"
@@ -18,11 +19,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jzg-lab/sub-data-save/internal/archive"
 	pluginv1 "github.com/jzg-lab/sub-data-save/pkg/pluginapi/v1"
+	"google.golang.org/grpc/metadata"
 )
 
 const (
-	ID      = "jzg-lab.sub-data-save"
-	Version = "0.2.0"
+	ID                = "jzg-lab.sub-data-save"
+	Version           = "0.3.1"
+	archiveGeneration = "rawdata-v2"
 )
 
 type config struct {
@@ -51,11 +54,15 @@ type Server struct {
 	jsonl       *archive.JSONLWriter
 	cfg         config
 	s3          objectUploader
+	captureMu   sync.Mutex
+	diskHasRoom func(string, uint64) (bool, error)
 	uploadMu    sync.Mutex
 	uploadTimer *time.Timer
+	dailyTimer  *time.Timer
+	dailyFailed bool
 }
 
-func New() *Server { return &Server{} }
+func New() *Server { return &Server{diskHasRoom: filesystemHasRoom} }
 
 func (s *Server) GetInfo(context.Context, *pluginv1.GetInfoRequest) (*pluginv1.GetInfoResponse, error) {
 	return &pluginv1.GetInfoResponse{
@@ -70,11 +77,16 @@ func (s *Server) Health(ctx context.Context, _ *pluginv1.HealthRequest) (*plugin
 		return nil, err
 	}
 	s.mu.RLock()
-	ready := s.store != nil
-	s.mu.RUnlock()
+	defer s.mu.RUnlock()
 	message := "awaiting configuration"
-	if ready {
-		message = "archive ready"
+	if s.store != nil {
+		message = s.captureSpaceStatus(0)
+		if message == "" {
+			message = "archive ready"
+		}
+		if s.dailyFailed {
+			message += "; daily ZIP failed, will retry"
+		}
 	}
 	return &pluginv1.HealthResponse{Healthy: true, Message: message}, nil
 }
@@ -105,6 +117,8 @@ func (s *Server) ApplyConfig(ctx context.Context, req *pluginv1.ApplyConfigReque
 	defer s.uploadMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Never recover or upload legacy shards with the new privacy contract.
+	cfg.Directory = filepath.Join(cfg.Directory, archiveGeneration)
 	if s.store == nil || s.cfg.Directory != cfg.Directory {
 		store, err := archive.Open(cfg.Directory, archive.Limits{MaxRecords: 100_000, MaxBytes: 10 << 30, MaxRecordBytes: 60 << 20})
 		if err != nil {
@@ -120,6 +134,11 @@ func (s *Server) ApplyConfig(ctx context.Context, req *pluginv1.ApplyConfigReque
 			}
 		}
 		s.store, s.jsonl = store, jsonl
+		if s.dailyTimer != nil {
+			s.dailyTimer.Stop()
+		}
+		s.dailyFailed = false
+		s.scheduleDailyLocked(cfg.Directory, time.Second)
 	}
 	s.cfg, s.s3 = cfg, uploader
 	s.scheduleUploadLocked(time.Second)
@@ -189,24 +208,29 @@ func (s *Server) TestConfig(ctx context.Context, req *pluginv1.TestConfigRequest
 }
 
 func (s *Server) CaptureRecord(ctx context.Context, req *pluginv1.CaptureRecordRequest) (*pluginv1.CaptureRecordResponse, error) {
+	s.captureMu.Lock()
+	defer s.captureMu.Unlock()
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	store, jsonl := s.store, s.jsonl
 	cfg := s.cfg
 	if store == nil {
-		s.mu.RUnlock()
 		return &pluginv1.CaptureRecordResponse{Accepted: false, Message: "archive is not configured"}, nil
 	}
-	if !matchesFilters(cfg, req.GetRecordJson()) {
-		s.mu.RUnlock()
+	if !matchesFilters(ctx, cfg, req.GetRecordJson()) {
 		return &pluginv1.CaptureRecordResponse{Accepted: false, Message: "record is outside configured filters"}, nil
 	}
 	if req.GetCompletedAtUnixNano() <= 0 {
-		s.mu.RUnlock()
 		return &pluginv1.CaptureRecordResponse{Accepted: false, Message: "invalid completion time"}, nil
 	}
+	if message := s.captureSpaceStatus(uint64(len(req.GetRecordJson()))); message != "" {
+		return &pluginv1.CaptureRecordResponse{Message: message}, nil
+	}
 	completedAt := time.Unix(0, req.GetCompletedAtUnixNano())
-	if _, err := store.Save(ctx, req.GetInstanceId(), req.GetRecordId(), completedAt, req.GetRecordJson()); err != nil && err != archive.ErrLimitReached {
-		s.mu.RUnlock()
+	if _, err := store.Save(ctx, req.GetInstanceId(), req.GetRecordId(), completedAt, req.GetRecordJson()); err != nil {
+		if errors.Is(err, archive.ErrLimitReached) {
+			return &pluginv1.CaptureRecordResponse{Message: "raw archive quota exceeded"}, nil
+		}
 		if errors.Is(err, archive.ErrDuplicateID) {
 			return &pluginv1.CaptureRecordResponse{Accepted: false, Message: "archive record already exists"}, nil
 		}
@@ -214,22 +238,41 @@ func (s *Server) CaptureRecord(ctx context.Context, req *pluginv1.CaptureRecordR
 	}
 	_, err := jsonl.Append(req.GetRecordJson(), completedAt)
 	if err != nil {
-		s.mu.RUnlock()
-		return &pluginv1.CaptureRecordResponse{Accepted: false, Message: "JSONL write failed"}, nil
+		return &pluginv1.CaptureRecordResponse{Accepted: false, Message: "raw JSON saved; JSONL write failed"}, nil
 	}
-	s.mu.RUnlock()
 	return &pluginv1.CaptureRecordResponse{Accepted: true}, nil
 }
 
-func matchesFilters(cfg config, raw []byte) bool {
+func (s *Server) captureSpaceStatus(recordBytes uint64) string {
+	// A record may be written as both raw JSON and a JSONL line.
+	const reserve = 20 << 30
+	required := reserve + 2*recordBytes + 1
+	for _, directory := range [2]string{s.cfg.Directory, filepath.Join(s.cfg.Directory, "jsonl")} {
+		ok, err := s.diskHasRoom(directory, required)
+		if err != nil {
+			return "capture paused: cannot check archive disk space"
+		}
+		if !ok {
+			return "capture paused: insufficient archive disk space (20 GiB reserve)"
+		}
+	}
+	return ""
+}
+
+func matchesFilters(ctx context.Context, cfg config, raw []byte) bool {
 	if len(cfg.GroupIDs) == 0 || len(cfg.Models) == 0 {
 		return false
 	}
 	var record struct {
+		SchemaVersion  int    `json:"schema_version"`
 		GroupID        int64  `json:"group_id"`
 		RequestedModel string `json:"requested_model"`
 	}
-	if json.Unmarshal(raw, &record) != nil || record.GroupID <= 0 || strings.TrimSpace(record.RequestedModel) == "" {
+	if json.Unmarshal(raw, &record) != nil || record.SchemaVersion != 2 || record.GroupID <= 0 || strings.TrimSpace(record.RequestedModel) == "" {
+		return false
+	}
+	digest := metadata.ValueFromIncomingContext(ctx, "capture-filter-model-bin")
+	if len(digest) != 1 || len(digest[0]) != sha256.Size {
 		return false
 	}
 	groupMatched, modelMatched := false, false
@@ -237,7 +280,8 @@ func matchesFilters(cfg config, raw []byte) bool {
 		groupMatched = groupMatched || id == record.GroupID
 	}
 	for _, model := range cfg.Models {
-		modelMatched = modelMatched || model == record.RequestedModel
+		hash := sha256.Sum256([]byte(model))
+		modelMatched = modelMatched || string(hash[:]) == digest[0]
 	}
 	return groupMatched && modelMatched
 }
@@ -276,7 +320,7 @@ func (s *Server) flushAndUpload() {
 			if openErr != nil {
 				continue
 			}
-			uploadErr := uploader.Upload(context.Background(), &s3.PutObjectInput{Bucket: aws.String(cfg.Bucket), Key: aws.String(key), Body: file})
+			uploadErr := uploader.Upload(context.Background(), &s3.PutObjectInput{Bucket: aws.String(cfg.Bucket), Key: aws.String(archiveGeneration + "/" + key), Body: file})
 			closeErr := file.Close()
 			if uploadErr == nil && closeErr == nil {
 				_ = archive.MarkUploaded(path)
