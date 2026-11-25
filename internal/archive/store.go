@@ -16,10 +16,11 @@ import (
 )
 
 var (
-	ErrLimitReached = errors.New("archive limit reached")
-	ErrDuplicateID  = errors.New("archive record already exists")
-	ErrInvalidJSON  = errors.New("archive record is not a complete JSON object")
-	idPattern       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	ErrLimitReached   = errors.New("archive limit reached")
+	ErrRecordTooLarge = fmt.Errorf("%w: record too large", ErrLimitReached)
+	ErrDuplicateID    = errors.New("archive record already exists")
+	ErrInvalidJSON    = errors.New("archive record is not a complete JSON object")
+	idPattern         = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
 
 type Limits struct {
@@ -78,7 +79,7 @@ func (s *Store) Save(ctx context.Context, instanceID, recordID string, completed
 		return "", err
 	}
 	if int64(len(data)) > s.limits.MaxRecordBytes {
-		return "", ErrLimitReached
+		return "", ErrRecordTooLarge
 	}
 	if len(data) == 0 || !json.Valid(data) || bytes.TrimSpace(data)[0] != '{' {
 		return "", ErrInvalidJSON
@@ -86,19 +87,19 @@ func (s *Store) Save(ctx context.Context, instanceID, recordID string, completed
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.count >= s.limits.MaxRecords || s.bytes+int64(len(data)) > s.limits.MaxBytes {
-		return "", ErrLimitReached
-	}
 	date := completedAt.UTC()
 	dir := filepath.Join(s.root, date.Format("2006"), date.Format("01"), date.Format("02"), instanceID)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", fmt.Errorf("create archive record directory: %w", err)
-	}
 	path := filepath.Join(dir, recordID+".json")
 	if _, err := os.Lstat(path); err == nil {
 		return "", ErrDuplicateID
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("inspect archive destination: %w", err)
+	}
+	if s.count >= s.limits.MaxRecords || s.bytes+int64(len(data)) > s.limits.MaxBytes {
+		return "", ErrLimitReached
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("create archive record directory: %w", err)
 	}
 	tmp, err := os.CreateTemp(dir, ".pending-*")
 	if err != nil {
