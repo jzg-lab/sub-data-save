@@ -3,6 +3,46 @@ set -eu
 
 # Signing is the default; development packages require an explicit opt-out.
 signing_key=${S2PLUGIN_KEY:-"$HOME/.config/sub-data-save/publisher-v1.private.pem"}
+if [ "${1:-}" = --install-signing-key ]; then
+  node - "${2:-$signing_key}" <<'NODE'
+const fs = require('node:fs')
+const path = require('node:path')
+const os = require('node:os')
+const crypto = require('node:crypto')
+const dir = path.join(os.homedir(), '.config', 'sub-data-save')
+const dest = path.join(dir, 'publisher-v1.private.pem')
+// This public key is pinned to this plugin ID by the gateway.
+const trusted = Buffer.from('7Vmw+FaG7muaH0nqY+Hx5YwSR8KP5ieREtOJDiQZ2T4=', 'base64url')
+function check(bytes) {
+  const pub = crypto.createPublicKey(crypto.createPrivateKey(bytes)).export({format:'jwk'})
+  if (pub.crv !== 'Ed25519' || !Buffer.from(pub.x, 'base64url').equals(trusted)) {
+    throw Error('Selected private key does not match the trusted publisher.')
+  }
+}
+try {
+  const bytes = fs.readFileSync(process.argv[2])
+  check(bytes)
+  fs.mkdirSync(dir, {recursive:true, mode:0o700})
+  fs.chmodSync(dir, 0o700)
+  const tmp = fs.mkdtempSync(path.join(dir, '.install-'))
+  const staged = path.join(tmp, 'key')
+  try {
+    fs.writeFileSync(staged, bytes, {flag:'wx', mode:0o600})
+    try { fs.linkSync(staged, dest) } catch (e) {
+      if (e.code !== 'EEXIST') throw e
+      if (!fs.lstatSync(dest).isFile()) throw Error('Existing signer must be a regular file.')
+      check(fs.readFileSync(dest))
+      fs.chmodSync(dest, 0o600)
+    }
+  } finally { fs.rmSync(tmp, {recursive:true, force:true}) }
+  console.log('Trusted publisher key configured for this user.')
+} catch (e) {
+  console.error('Publisher key setup failed:', e.code || e.message)
+  process.exitCode = 1
+}
+NODE
+  exit $?
+fi
 if [ "${S2PLUGIN_UNSIGNED:-0}" != 1 ] && [ ! -f "$signing_key" ]; then
   printf '%s\n' 'Missing publisher key: set S2PLUGIN_KEY, or S2PLUGIN_UNSIGNED=1 for local development.' >&2
   exit 1

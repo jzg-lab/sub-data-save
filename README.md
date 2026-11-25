@@ -47,6 +47,8 @@ GOOS=darwin GOARCH=arm64 ./build.sh
 
 构建默认签名，私钥从 `S2PLUGIN_KEY` 或 `~/.config/sub-data-save/publisher-v1.private.pem` 读取；不自动生成或提交私钥。`S2PLUGIN_UNSIGNED=1` 仅用于明确允许未签名包的开发环境。
 
+首次配置构建机时，在已设置 `S2PLUGIN_KEY` 的终端运行 `./build.sh --install-signing-key`。也可在命令末尾传入现有私钥的文件路径。脚本核对宿主信任的发布者公钥后，将私钥保存到当前用户的固定位置，目录权限为 `0700`，文件权限为 `0600`。以后同一用户可直接运行 `./build.sh` 签名，整个过程在构建机上完成。
+
 部署新版本前需从当前源码构建签名包。
 
 ## 当前成果来源
